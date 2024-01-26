@@ -13,14 +13,20 @@ Parser :: rawptr;
 Language :: rawptr;
 Tree :: rawptr;
 Query :: rawptr;
+QueryCursor :: rawptr;
 
 QueryError :: u8;
 
-Node :: struct  #packed {
+Node :: struct {
   ctx: [4]u32,
   id: rawptr,
   tree: Tree,
 };
+
+Point :: struct {
+  row: u32,
+  column: u32
+}
 
 QueryCapture :: struct {
   node: Node,
@@ -38,11 +44,18 @@ QueryMatch :: struct {
 foreign ts {
   parser_new :: proc() -> Parser ---;
   parser_set_language :: proc(parser: Parser, language: Language) ---;
-  parser_parse_string :: proc (parser: Parser, tree: Tree, source: cstring, source_len: u32) -> Tree ---;
-  tree_print_dot_graph :: proc (tree: Tree, file: c.int) ---;
-  tree_root_node :: proc (tree: Tree) -> Node ---;
+  parser_parse_string :: proc(parser: Parser, tree: Tree, source: cstring, source_len: u32) -> Tree ---;
+  tree_print_dot_graph :: proc(tree: Tree, file: c.int) ---;
+  tree_root_node :: proc(tree: Tree) -> Node ---;
   node_string :: proc(root_node: Node) -> cstring ---;
+  node_start_byte :: proc(node: Node) -> u32 ---;
+  node_end_byte :: proc(node: Node) -> u32 ---;
+  node_start_point :: proc (node: Node) -> Point ---;
+  node_end_point :: proc (node: Node) -> Point ---;
   query_new :: proc(language: Language, source: cstring, source_len: u32, error_offset: ^u32, error_type: ^QueryError) -> Query ---;
+  query_cursor_new :: proc() -> QueryCursor ---;
+  query_cursor_exec :: proc(cursor: QueryCursor, query: Query, node: Node) ---;
+  query_cursor_next_match :: proc(cursor: QueryCursor, match: ^QueryMatch) -> bool ---;
 }
 
 foreign parser {
@@ -52,6 +65,8 @@ foreign parser {
 Process_Kotlin_File_Error :: enum {
   Parse_Failed = 1
 }
+
+language := tree_sitter_kotlin()
 
 process_kotlin_file :: proc(parser: ^Parser, filepath: string) -> (err: Process_Kotlin_File_Error) {
   // source, ok := os.read_entire_file_from_filename(filepath)
@@ -71,23 +86,58 @@ Remove_Wiring_Error :: enum {
 }
 
 remove_wiring_from_presenter :: proc(parser: ^Parser, presenter_filepath: string, wiring_filepath: string) -> (err: Remove_Wiring_Error) {
-  source : []u8
+  presenter_source : []u8
+  wiring_source : []u8
   ok : bool
-  source, ok = os.read_entire_file_from_filename(presenter_filepath)
+  presenter_source, ok = os.read_entire_file_from_filename(presenter_filepath)
   if !ok {
     return .PresenterParseFailed
   }
-  presenter_tree := parser_parse_string(parser^, nil, cstring(raw_data(source)), u32(len(source)))
-  source, ok = os.read_entire_file_from_filename(wiring_filepath)
+  presenter_tree := parser_parse_string(parser^, nil, cstring(raw_data(presenter_source)), u32(len(presenter_source)))
+  wiring_source, ok = os.read_entire_file_from_filename(wiring_filepath)
   if !ok {
     return .WiringParseFailed
   }
-  wiring_tree := parser_parse_string(parser^, nil, cstring(raw_data(source)), u32(len(source)))
-  // tree := parser_parse_string(parser^, nil, cstring(raw_data(source)), u32(len(source)))
-  // root_node := tree_root_node(tree)
-  fmt.eprintf("Source tree of %s:\n%s\n\n", presenter_filepath, node_string(tree_root_node(presenter_tree)))
-  fmt.eprintf("Source tree of %s:\n%s\n\n", wiring_filepath, node_string(tree_root_node(wiring_tree)))
+  wiring_tree := parser_parse_string(parser^, nil, cstring(raw_data(wiring_source)), u32(len(wiring_source)))
+
+  wiring_calls_query_source := `
+(
+(navigation_expression
+ (simple_identifier) @nav_id
+ (navigation_suffix (simple_identifier) @method)
+)
+)
+`
+  error_offset : u32
+  error_type : QueryError
+  query := query_new(
+    language,
+    cstring(raw_data(wiring_calls_query_source)),
+    u32(len(wiring_calls_query_source)),
+    &error_offset,
+    &error_type
+  )
+  cursor := query_cursor_new()
+  query_cursor_exec(cursor, query, tree_root_node(presenter_tree))
+
+  match : QueryMatch
+
+  fmt.eprintf("%s:\n", presenter_filepath)
+  for (query_cursor_next_match(cursor, &match)) {
+    assert(match.capture_count == 2)
+    object := source_text(match.captures[0], presenter_source)
+    if string(object) == "wiring" {
+      method := source_text(match.captures[1], presenter_source)
+      fmt.eprintf("  %s -> %s\n", object, method)
+    }
+  }
   return .None
+}
+
+source_text :: proc(capture: QueryCapture, source: []u8) -> []u8 {
+  start := node_start_byte(capture.node)
+  end := node_end_byte(capture.node)
+  return source[start:end]
 }
 
 walk_proc :: proc(info: os.File_Info, in_err: os.Errno, user_data: rawptr) -> (err: os.Errno, skip_dir: bool) {
@@ -152,7 +202,7 @@ main :: proc() {
   }
 
   parser := parser_new()
-  parser_set_language(parser, tree_sitter_kotlin())
+  parser_set_language(parser, language)
 
   root := os.args[1]
   err := filepath.walk(root, walk_proc, &parser)
