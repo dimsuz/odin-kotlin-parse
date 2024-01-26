@@ -5,6 +5,7 @@ import "core:path/filepath"
 import "core:os"
 import "core:strings"
 import "core:c"
+import "core:mem"
 
 foreign import parser "clib/tree-sitter-kotlin/parser.a"
 foreign import ts "clib/tree-sitter-kotlin/libtree-sitter.a"
@@ -54,6 +55,7 @@ foreign ts {
   node_end_point :: proc (node: Node) -> Point ---;
   query_new :: proc(language: Language, source: cstring, source_len: u32, error_offset: ^u32, error_type: ^QueryError) -> Query ---;
   query_cursor_new :: proc() -> QueryCursor ---;
+  query_cursor_delete :: proc(cursor: QueryCursor) ---;
   query_cursor_exec :: proc(cursor: QueryCursor, query: Query, node: Node) ---;
   query_cursor_next_match :: proc(cursor: QueryCursor, match: ^QueryMatch) -> bool ---;
 }
@@ -101,34 +103,78 @@ remove_wiring_from_presenter :: proc(parser: ^Parser, presenter_filepath: string
   wiring_tree := parser_parse_string(parser^, nil, cstring(raw_data(wiring_source)), u32(len(wiring_source)))
 
   wiring_calls_query_source := `
-(
-(navigation_expression
- (simple_identifier) @nav_id
- (navigation_suffix (simple_identifier) @method)
+(call_expression
+  (navigation_expression
+   (simple_identifier) @nav_id
+   (navigation_suffix (simple_identifier) @method)
+  )
+  (call_suffix (value_arguments) @args)
 )
-)
+
+`
+  method_body_query_source := `
+(function_declaration
+ (simple_identifier) @name
+   (function_body (_) @body)
+ )
 `
   error_offset : u32
   error_type : QueryError
-  query := query_new(
+
+  cursor := query_cursor_new()
+  defer query_cursor_delete(cursor)
+  method_body_cursor := query_cursor_new()
+  defer query_cursor_delete(method_body_cursor)
+
+  method_calls_query := query_new(
     language,
     cstring(raw_data(wiring_calls_query_source)),
     u32(len(wiring_calls_query_source)),
     &error_offset,
     &error_type
   )
-  cursor := query_cursor_new()
-  query_cursor_exec(cursor, query, tree_root_node(presenter_tree))
+  query_cursor_exec(cursor, method_calls_query, tree_root_node(presenter_tree))
 
-  match : QueryMatch
+  method_body_query := query_new(
+    language,
+    cstring(raw_data(method_body_query_source)),
+    u32(len(method_body_query_source)),
+    &error_offset,
+    &error_type
+  )
+
+  presenter_query_match : QueryMatch
+  method_body_query_match : QueryMatch
 
   fmt.eprintf("%s:\n", presenter_filepath)
-  for (query_cursor_next_match(cursor, &match)) {
-    assert(match.capture_count == 2)
-    object := source_text(match.captures[0], presenter_source)
+  for (query_cursor_next_match(cursor, &presenter_query_match)) {
+    assert(presenter_query_match.capture_count == 3)
+    object := source_text(presenter_query_match.captures[0], presenter_source)
     if string(object) == "wiring" {
-      method := source_text(match.captures[1], presenter_source)
-      fmt.eprintf("  %s -> %s\n", object, method)
+      method := source_text(presenter_query_match.captures[1], presenter_source)
+      args := source_text(presenter_query_match.captures[2], presenter_source)
+
+      // TODO walk @args, it will have this structure
+      // (value_arguments
+      //   (value_argument
+      //     (simple_identifier)? // optional arg name
+      //     (_) // either literal, or call_expr, or nav_expr, etc, i.e the arg itself,
+      //     which we need
+      //   )
+      // )
+
+      fmt.eprintf("  %s.%s%s\n", object, method, args)
+      query_cursor_exec(method_body_cursor, method_body_query, tree_root_node(wiring_tree))
+      for (query_cursor_next_match(method_body_cursor, &method_body_query_match)) {
+        name := source_text(method_body_query_match.captures[0], wiring_source)
+        if mem.compare(name, method) == 0 {
+          body_capture := method_body_query_match.captures[1]
+          body := source_text(body_capture, wiring_source)
+          // TODO find if body node's next elements are (statements (jump_expression)) -> return, remove it before pasting
+          // otherwise paste as is
+          fmt.eprintf("    %s\n", body)
+        }
+      }
     }
   }
   return .None
