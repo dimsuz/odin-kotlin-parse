@@ -109,8 +109,7 @@ remove_wiring_from_presenter :: proc(parser: ^Parser, presenter_filepath: string
    (navigation_suffix (simple_identifier) @method)
   )
   (call_suffix (value_arguments) @args)
-)
-
+) @call_expr
 `
   method_body_query_source := `
 (function_declaration
@@ -148,11 +147,11 @@ remove_wiring_from_presenter :: proc(parser: ^Parser, presenter_filepath: string
 
   fmt.eprintf("%s:\n", presenter_filepath)
   for (query_cursor_next_match(cursor, &presenter_query_match)) {
-    assert(presenter_query_match.capture_count == 3)
-    object := source_text(presenter_query_match.captures[0], presenter_source)
+    assert(presenter_query_match.capture_count == 4)
+    object := source_text(capture_by_index(presenter_query_match, 0), presenter_source)
     if string(object) == "wiring" {
-      method := source_text(presenter_query_match.captures[1], presenter_source)
-      args := source_text(presenter_query_match.captures[2], presenter_source)
+      method := source_text(capture_by_index(presenter_query_match, 1), presenter_source)
+      args := source_text(capture_by_index(presenter_query_match, 2), presenter_source)
 
       // TODO walk @args, it will have this structure
       // (value_arguments
@@ -162,13 +161,14 @@ remove_wiring_from_presenter :: proc(parser: ^Parser, presenter_filepath: string
       //     which we need
       //   )
       // )
+      //
 
       fmt.eprintf("  %s.%s%s\n", object, method, args)
       query_cursor_exec(method_body_cursor, method_body_query, tree_root_node(wiring_tree))
       for (query_cursor_next_match(method_body_cursor, &method_body_query_match)) {
-        name := source_text(method_body_query_match.captures[0], wiring_source)
+        name := source_text(capture_by_index(method_body_query_match, 0), wiring_source)
         if mem.compare(name, method) == 0 {
-          body_capture := method_body_query_match.captures[1]
+          body_capture := capture_by_index(method_body_query_match, 1)
           body := source_text(body_capture, wiring_source)
           // TODO find if body node's next elements are (statements (jump_expression)) -> return, remove it before pasting
           // otherwise paste as is
@@ -178,6 +178,20 @@ remove_wiring_from_presenter :: proc(parser: ^Parser, presenter_filepath: string
     }
   }
   return .None
+}
+
+capture_by_index :: proc(match: QueryMatch, capture_index: u32) -> QueryCapture {
+  i: u16
+  found := false
+  for idx in 0..<match.capture_count {
+    if match.captures[idx].index == capture_index {
+      i = idx
+      found = true
+      break
+    }
+  }
+  assert(found)
+  return match.captures[i]
 }
 
 source_text :: proc(capture: QueryCapture, source: []u8) -> []u8 {
