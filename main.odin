@@ -6,6 +6,8 @@ import "core:os"
 import "core:strings"
 import "core:c"
 import "core:mem"
+import "core:bytes"
+import "core:slice"
 
 foreign import parser "clib/tree-sitter-kotlin/parser.a"
 foreign import ts "clib/tree-sitter-kotlin/libtree-sitter.a"
@@ -41,6 +43,15 @@ QueryMatch :: struct {
   captures: [^]QueryCapture,
 }
 
+InputEdit :: struct {
+  start_byte: u32,
+  old_end_byte: u32,
+  new_end_byte: u32,
+  start_point: Point,
+  old_end_point: Point,
+  new_end_point: Point,
+}
+
 @(link_prefix = "ts_")
 foreign ts {
   parser_new :: proc() -> Parser ---;
@@ -48,6 +59,7 @@ foreign ts {
   parser_parse_string :: proc(parser: Parser, tree: Tree, source: cstring, source_len: u32) -> Tree ---;
   tree_print_dot_graph :: proc(tree: Tree, file: c.int) ---;
   tree_root_node :: proc(tree: Tree) -> Node ---;
+  tree_edit :: proc (tree: Tree, edit: ^InputEdit) ---;
   node_string :: proc(root_node: Node) -> cstring ---;
   node_start_byte :: proc(node: Node) -> u32 ---;
   node_end_byte :: proc(node: Node) -> u32 ---;
@@ -114,8 +126,9 @@ remove_wiring_from_presenter :: proc(parser: ^Parser, presenter_filepath: string
   method_body_query_source := `
 (function_declaration
  (simple_identifier) @name
+   (function_value_parameters) @params
    (function_body (_) @body)
- )
+ ) @body_expr
 `
   error_offset : u32
   error_type : QueryError
@@ -145,13 +158,21 @@ remove_wiring_from_presenter :: proc(parser: ^Parser, presenter_filepath: string
   presenter_query_match : QueryMatch
   method_body_query_match : QueryMatch
 
+  editable_presenter_source : [dynamic]u8
+
   fmt.eprintf("%s:\n", presenter_filepath)
+  replaced := false
   for (query_cursor_next_match(cursor, &presenter_query_match)) {
+    if len(editable_presenter_source) == 0 {
+      resize(&editable_presenter_source, len(presenter_source))
+      copy(editable_presenter_source[:], presenter_source[:])
+    }
+
     assert(presenter_query_match.capture_count == 4)
-    object := source_text(capture_by_index(presenter_query_match, 0), presenter_source)
+    object := source_text(capture_by_index(presenter_query_match, 0), editable_presenter_source[:])
     if string(object) == "wiring" {
-      method := source_text(capture_by_index(presenter_query_match, 1), presenter_source)
-      args := source_text(capture_by_index(presenter_query_match, 2), presenter_source)
+      method := source_text(capture_by_index(presenter_query_match, 1), editable_presenter_source[:])
+      args := source_text(capture_by_index(presenter_query_match, 2), editable_presenter_source[:])
 
       // TODO walk @args, it will have this structure
       // (value_arguments
@@ -166,15 +187,78 @@ remove_wiring_from_presenter :: proc(parser: ^Parser, presenter_filepath: string
       fmt.eprintf("  %s.%s%s\n", object, method, args)
       query_cursor_exec(method_body_cursor, method_body_query, tree_root_node(wiring_tree))
       for (query_cursor_next_match(method_body_cursor, &method_body_query_match)) {
+        assert(method_body_query_match.capture_count == 4)
         name := source_text(capture_by_index(method_body_query_match, 0), wiring_source)
         if mem.compare(name, method) == 0 {
-          body_capture := capture_by_index(method_body_query_match, 1)
-          body := source_text(body_capture, wiring_source)
-          // TODO find if body node's next elements are (statements (jump_expression)) -> return, remove it before pasting
-          // otherwise paste as is
-          fmt.eprintf("    %s\n", body)
+
+
+          // if true {
+          //   insert_source := fmt.aprintf("// noship wiring call with args: %s\n", args)
+          //   insert_tree := parser_parse_string(parser^, nil, cstring(raw_data(insert_source)), u32(len(insert_source)))
+
+          //   inject_at_elems(
+          //     &editable_presenter_source,
+          //     int(node_start_byte(wiring_call_capture.node)),
+          //     ..body
+          //   )
+          //   edit := node_replacement_edit(capture_by_index(method_body_query_match, 2).node, wiring_call_capture.node)
+          //   tree_edit(presenter_tree, &edit)
+          //   presenter_tree = parser_parse_string(parser^, presenter_tree, cstring(raw_data(editable_presenter_source)), u32(len(editable_presenter_source)))
+          //   // cursor seems to be invalidated after edit... run query again.
+          //   query_cursor_exec(cursor, method_calls_query, tree_root_node(presenter_tree))
+          // }
+
+          wiring_call_capture := capture_by_index(presenter_query_match, 3)
+          wiring_fun_body_source := source_text(capture_by_index(method_body_query_match, 2), wiring_source)
+
+          insert_source : []u8
+          insert_node : Node
+          if (string(args) != "()") {
+            call_args_fmt, _ := strings.replace_all(string(args), "\n", " ")
+            fun_args := source_text(capture_by_index(method_body_query_match, 1), wiring_source)
+            fun_args_fmt, _  := strings.replace_all(string(fun_args), "\n", " ")
+            padding := make([]u8, node_start_point(wiring_call_capture.node).column)
+            slice.fill(padding, ' ')
+            insert_source = transmute([]u8)fmt.aprintf("%s// noship wiring call with args:\n%s// call_args:  %s\n%s// fun_params: %s\n%s%s\n", padding, padding, call_args_fmt, padding, fun_args_fmt, padding, wiring_fun_body_source)
+            insert_node = tree_root_node(parser_parse_string(parser^, nil, cstring(raw_data(insert_source)), u32(len(insert_source))))
+          } else {
+            insert_source = wiring_fun_body_source
+            insert_node = capture_by_index(method_body_query_match, 2).node
+          }
+
+          remove_range(
+            &editable_presenter_source,
+            int(node_start_byte(wiring_call_capture.node)),
+            int(node_end_byte(wiring_call_capture.node))
+          )
+          inject_at_elems(
+            &editable_presenter_source,
+            int(node_start_byte(wiring_call_capture.node)),
+            ..insert_source
+          )
+          edit := node_replacement_edit(insert_node, wiring_call_capture.node)
+          tree_edit(presenter_tree, &edit)
+          presenter_tree = parser_parse_string(parser^, presenter_tree, cstring(raw_data(editable_presenter_source)), u32(len(editable_presenter_source)))
+          // cursor seems to be invalidated after edit... run query again.
+          query_cursor_exec(cursor, method_calls_query, tree_root_node(presenter_tree))
+
+          fmt.eprintf("    %s\n", wiring_fun_body_source)
+          replaced = true
         }
       }
+    }
+  }
+  if (replaced) {
+    output: []u8
+    on_each_return := transmute([]u8)string("onEach(return ")
+    if bytes.contains(editable_presenter_source[:], on_each_return) {
+      on_each := transmute([]u8)string("onEach(")
+      output, _ = bytes.replace_all(editable_presenter_source[:], on_each_return, on_each)
+    } else {
+      output = editable_presenter_source[:]
+    }
+    if !os.write_entire_file(presenter_filepath, output) {
+      fmt.eprintf("failed to write upodated file %s", presenter_filepath)
     }
   }
   return .None
@@ -192,6 +276,31 @@ capture_by_index :: proc(match: QueryMatch, capture_index: u32) -> QueryCapture 
   }
   assert(found)
   return match.captures[i]
+}
+
+// Calculates an TS "edit" for replacing dst_node content with src_node content
+node_replacement_edit :: proc(src_node: Node, dst_node: Node) -> InputEdit {
+  dst_start_byte := node_start_byte(dst_node)
+  dst_end_byte := node_end_byte(dst_node)
+  src_start_byte := node_start_byte(src_node)
+  src_end_byte := node_end_byte(src_node)
+  dst_start_point := node_start_point(dst_node)
+  dst_end_point := node_end_point(dst_node)
+  src_start_point := node_start_point(src_node)
+  src_end_point := node_end_point(src_node)
+  edit := InputEdit{
+    start_byte = dst_start_byte,
+    old_end_byte = dst_end_byte,
+    new_end_byte = dst_start_byte + (src_end_byte - src_start_byte),
+    start_point = dst_start_point,
+    old_end_point = dst_end_point,
+    new_end_point = Point{
+      row = dst_start_point.row + (dst_end_point.row - src_end_point.row),
+      column = dst_end_point.column
+    }
+  }
+  return edit
+
 }
 
 source_text :: proc(capture: QueryCapture, source: []u8) -> []u8 {
