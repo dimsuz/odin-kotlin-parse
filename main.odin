@@ -159,8 +159,6 @@ remove_wiring_from_presenter :: proc(parser: ^Parser, presenter_filepath: string
   method_body_query_match : QueryMatch
 
   editable_presenter_source : [dynamic]u8
-
-  fmt.eprintf("%s:\n", presenter_filepath)
   replaced := false
   for (query_cursor_next_match(cursor, &presenter_query_match)) {
     if len(editable_presenter_source) == 0 {
@@ -174,40 +172,11 @@ remove_wiring_from_presenter :: proc(parser: ^Parser, presenter_filepath: string
       method := source_text(capture_by_index(presenter_query_match, 1), editable_presenter_source[:])
       args := source_text(capture_by_index(presenter_query_match, 2), editable_presenter_source[:])
 
-      // TODO walk @args, it will have this structure
-      // (value_arguments
-      //   (value_argument
-      //     (simple_identifier)? // optional arg name
-      //     (_) // either literal, or call_expr, or nav_expr, etc, i.e the arg itself,
-      //     which we need
-      //   )
-      // )
-      //
-
-      fmt.eprintf("  %s.%s%s\n", object, method, args)
       query_cursor_exec(method_body_cursor, method_body_query, tree_root_node(wiring_tree))
       for (query_cursor_next_match(method_body_cursor, &method_body_query_match)) {
         assert(method_body_query_match.capture_count == 4)
         name := source_text(capture_by_index(method_body_query_match, 0), wiring_source)
         if mem.compare(name, method) == 0 {
-
-
-          // if true {
-          //   insert_source := fmt.aprintf("// noship wiring call with args: %s\n", args)
-          //   insert_tree := parser_parse_string(parser^, nil, cstring(raw_data(insert_source)), u32(len(insert_source)))
-
-          //   inject_at_elems(
-          //     &editable_presenter_source,
-          //     int(node_start_byte(wiring_call_capture.node)),
-          //     ..body
-          //   )
-          //   edit := node_replacement_edit(capture_by_index(method_body_query_match, 2).node, wiring_call_capture.node)
-          //   tree_edit(presenter_tree, &edit)
-          //   presenter_tree = parser_parse_string(parser^, presenter_tree, cstring(raw_data(editable_presenter_source)), u32(len(editable_presenter_source)))
-          //   // cursor seems to be invalidated after edit... run query again.
-          //   query_cursor_exec(cursor, method_calls_query, tree_root_node(presenter_tree))
-          // }
-
           wiring_call_capture := capture_by_index(presenter_query_match, 3)
           wiring_fun_body_source := source_text(capture_by_index(method_body_query_match, 2), wiring_source)
 
@@ -219,7 +188,7 @@ remove_wiring_from_presenter :: proc(parser: ^Parser, presenter_filepath: string
             fun_args_fmt, _  := strings.replace_all(string(fun_args), "\n", " ")
             padding := make([]u8, node_start_point(wiring_call_capture.node).column)
             slice.fill(padding, ' ')
-            insert_source = transmute([]u8)fmt.aprintf("%s// noship wiring call with args:\n%s// call_args:  %s\n%s// fun_params: %s\n%s%s\n", padding, padding, call_args_fmt, padding, fun_args_fmt, padding, wiring_fun_body_source)
+            insert_source = transmute([]u8)fmt.aprintf("// noship wiring call with args:\n%s// call_args:  %s\n%s// fun_params: %s\n%s%s", padding, call_args_fmt, padding, fun_args_fmt, padding, wiring_fun_body_source)
             insert_node = tree_root_node(parser_parse_string(parser^, nil, cstring(raw_data(insert_source)), u32(len(insert_source))))
           } else {
             insert_source = wiring_fun_body_source
@@ -242,7 +211,6 @@ remove_wiring_from_presenter :: proc(parser: ^Parser, presenter_filepath: string
           // cursor seems to be invalidated after edit... run query again.
           query_cursor_exec(cursor, method_calls_query, tree_root_node(presenter_tree))
 
-          fmt.eprintf("    %s\n", wiring_fun_body_source)
           replaced = true
         }
       }
@@ -258,11 +226,204 @@ remove_wiring_from_presenter :: proc(parser: ^Parser, presenter_filepath: string
       output = editable_presenter_source[:]
     }
     if !os.write_entire_file(presenter_filepath, output) {
-      fmt.eprintf("failed to write upodated file %s", presenter_filepath)
+      fmt.eprintf("failed to write updated file %s", presenter_filepath)
     }
   }
   return .None
 }
+
+Replace_Constructor_Params :: enum {
+  None,
+  PresenterParseFailed,
+  WiringParseFailed
+}
+
+replace_presenter_constructor_params :: proc(parser: ^Parser, presenter_filepath: string, wiring_filepath: string) -> (err: Replace_Constructor_Params) {
+  presenter_source : []u8
+  wiring_source : []u8
+  ok : bool
+  presenter_source, ok = os.read_entire_file_from_filename(presenter_filepath)
+  if !ok {
+    return .PresenterParseFailed
+  }
+  // TODO reuse trees from remove_wiring_from_presenter??
+  presenter_tree := parser_parse_string(parser^, nil, cstring(raw_data(presenter_source)), u32(len(presenter_source)))
+  wiring_source, ok = os.read_entire_file_from_filename(wiring_filepath)
+  if !ok {
+    return .WiringParseFailed
+  }
+  wiring_tree := parser_parse_string(parser^, nil, cstring(raw_data(wiring_source)), u32(len(wiring_source)))
+
+  query_source := `
+(class_declaration
+ (type_identifier) @class_name
+ (primary_constructor
+  (class_parameter
+   (user_type) @type
+  ) @class_parameter
+ )
+)
+`
+  error_offset : u32
+  error_type : QueryError
+
+  cursor := query_cursor_new()
+  defer query_cursor_delete(cursor)
+
+  presenter_params_cursor := query_cursor_new()
+  defer query_cursor_delete(presenter_params_cursor)
+
+  class_params_query := query_new(
+    language,
+    cstring(raw_data(query_source)),
+    u32(len(query_source)),
+    &error_offset,
+    &error_type
+  )
+
+  wiring_impl_params_query_match : QueryMatch
+  presenter_params_query_match : QueryMatch
+  editable_presenter_source : [dynamic]u8
+  replaced := false
+
+  query_cursor_exec(cursor, class_params_query, tree_root_node(wiring_tree))
+
+  param_nodes : [dynamic]Node
+
+  for (query_cursor_next_match(cursor, &wiring_impl_params_query_match)) {
+    assert(wiring_impl_params_query_match.capture_count == 3)
+    class_name := source_text(capture_by_index(wiring_impl_params_query_match, 0), wiring_source)
+    if strings.has_suffix(string(class_name), "WiringImpl") {
+      wiring_impl_params_capture := capture_by_index(wiring_impl_params_query_match, 2)
+      append(&param_nodes, wiring_impl_params_capture.node)
+    }
+  }
+
+  if len(param_nodes) > 0 {
+    resize(&editable_presenter_source, len(presenter_source))
+    copy(editable_presenter_source[:], presenter_source[:])
+    query_cursor_exec(presenter_params_cursor, class_params_query, tree_root_node(presenter_tree))
+    for (query_cursor_next_match(presenter_params_cursor, &presenter_params_query_match)) {
+      assert(presenter_params_query_match.capture_count == 3)
+      parameter_type := source_text(capture_by_index(presenter_params_query_match, 1), presenter_source)
+      if strings.has_suffix(string(parameter_type), "Wiring") {
+        parameter_capture := capture_by_index(presenter_params_query_match, 2)
+        remove_range(
+            &editable_presenter_source,
+          int(node_start_byte(parameter_capture.node)),
+          int(node_end_byte(parameter_capture.node))
+        )
+        wiring_impl_source := wiring_source[node_start_byte(param_nodes[0]):node_end_byte(param_nodes[len(param_nodes) - 1])]
+        inject_at_elems(
+            &editable_presenter_source,
+          int(node_start_byte(parameter_capture.node)),
+          ..wiring_impl_source
+        )
+        edit := node_replacement_edit_range(param_nodes[0], param_nodes[len(param_nodes) - 1], parameter_capture.node)
+        tree_edit(presenter_tree, &edit)
+        presenter_tree = parser_parse_string(parser^, presenter_tree, cstring(raw_data(editable_presenter_source)), u32(len(editable_presenter_source)))
+        replaced = true
+        break
+      }
+    }
+  }
+
+  if (replaced) {
+    if !os.write_entire_file(presenter_filepath, editable_presenter_source[:]) {
+      fmt.eprintf("failed to write updated file %s", presenter_filepath)
+    }
+  }
+  return .None
+}
+
+Remove_Wiring_Bindings_Error :: enum {
+  None,
+  KeyParseFailed,
+}
+
+remove_wiring_bindings :: proc(parser: ^Parser, key_filepath: string) -> (err: Remove_Wiring_Bindings_Error) {
+  source, ok := os.read_entire_file_from_filename(key_filepath)
+  if !ok {
+    return .KeyParseFailed
+  }
+  tree := parser_parse_string(parser^, nil, cstring(raw_data(source)), u32(len(source)))
+
+  cursor := query_cursor_new()
+  defer query_cursor_delete(cursor)
+  error_offset : u32
+  error_type : QueryError
+
+  query_source := `
+(value_argument
+  (simple_identifier)
+  (call_expression
+    (simple_identifier) @call_name
+    (call_suffix
+     (annotated_lambda
+      (lambda_literal
+       (statements
+        (call_expression) @binding_call
+       )
+      )
+     )
+    )
+  )
+) @value_arg
+`
+  query := query_new(
+    language,
+    cstring(raw_data(query_source)),
+    u32(len(query_source)),
+    &error_offset,
+    &error_type
+  )
+
+  query_match : QueryMatch
+  query_cursor_exec(cursor, query, tree_root_node(tree))
+  bind_call_count := 0
+  wiring_bind_call_node : Node
+  entire_bindings_param_node : Node
+  for (query_cursor_next_match(cursor, &query_match)) {
+    assert(query_match.capture_count == 3)
+    call_name := source_text(capture_by_index(query_match, 0), source)
+    // if ToothpickScreenBindings lambda will contain multiple "module.bind" calls,
+    // each of them will come as a separate match in this for-loop => count them to
+    // decide how to act after "for"
+    if string(call_name) == "ToothpickScreenBindings" {
+      bind_call_capture := capture_by_index(query_match, 1)
+      if strings.contains(string(source_text(bind_call_capture, source)), "Wiring::class") {
+        wiring_bind_call_node = bind_call_capture.node
+        entire_capture := capture_by_index(query_match, 2)
+        entire_bindings_param_node = entire_capture.node
+      }
+      bind_call_count += 1
+    }
+  }
+  if wiring_bind_call_node.id != nil {
+    editable_source : [dynamic]u8
+    resize(&editable_source, len(source))
+    copy(editable_source[:], source[:])
+    if bind_call_count == 1  {
+      assert(entire_bindings_param_node.id != nil)
+      remove_range(
+        &editable_source,
+        int(node_start_byte(entire_bindings_param_node)),
+        int(node_end_byte(entire_bindings_param_node))
+      )
+    } else if bind_call_count > 1 && wiring_bind_call_node.id != nil {
+      remove_range(
+        &editable_source,
+        int(node_start_byte(wiring_bind_call_node)),
+        int(node_end_byte(wiring_bind_call_node))
+      )
+    }
+    if !os.write_entire_file(key_filepath, editable_source[:]) {
+      fmt.eprintf("failed to write updated file %s", key_filepath)
+    }
+  }
+  return .None
+}
+
 
 capture_by_index :: proc(match: QueryMatch, capture_index: u32) -> QueryCapture {
   i: u16
@@ -280,14 +441,19 @@ capture_by_index :: proc(match: QueryMatch, capture_index: u32) -> QueryCapture 
 
 // Calculates an TS "edit" for replacing dst_node content with src_node content
 node_replacement_edit :: proc(src_node: Node, dst_node: Node) -> InputEdit {
+  return node_replacement_edit_range(src_node, src_node, dst_node)
+}
+
+// Calculates an TS "edit" for replacing dst_node content with range of nodes described by src_node_start, src_node_end
+node_replacement_edit_range :: proc(src_node_start: Node, src_node_end: Node, dst_node: Node) -> InputEdit {
   dst_start_byte := node_start_byte(dst_node)
   dst_end_byte := node_end_byte(dst_node)
-  src_start_byte := node_start_byte(src_node)
-  src_end_byte := node_end_byte(src_node)
+  src_start_byte := node_start_byte(src_node_start)
+  src_end_byte := node_end_byte(src_node_end)
   dst_start_point := node_start_point(dst_node)
   dst_end_point := node_end_point(dst_node)
-  src_start_point := node_start_point(src_node)
-  src_end_point := node_end_point(src_node)
+  src_start_point := node_start_point(src_node_start)
+  src_end_point := node_end_point(src_node_end)
   edit := InputEdit{
     start_byte = dst_start_byte,
     old_end_byte = dst_end_byte,
@@ -300,7 +466,6 @@ node_replacement_edit :: proc(src_node: Node, dst_node: Node) -> InputEdit {
     }
   }
   return edit
-
 }
 
 source_text :: proc(capture: QueryCapture, source: []u8) -> []u8 {
@@ -329,6 +494,7 @@ walk_proc :: proc(info: os.File_Info, in_err: os.Errno, user_data: rawptr) -> (e
   }
   presenter_filepath := ""
   wiring_filepath := ""
+  key_filepath := ""
   has_subdirs := false
   for fi in files {
     if strings.has_suffix(fi.name, "Presenter.kt") {
@@ -337,6 +503,9 @@ walk_proc :: proc(info: os.File_Info, in_err: os.Errno, user_data: rawptr) -> (e
     if strings.has_suffix(fi.name, "Wiring.kt") {
       wiring_filepath = fi.fullpath
     }
+    if strings.has_suffix(fi.name, "Key.kt") {
+      key_filepath = fi.fullpath
+    }
     if fi.is_dir {
       has_subdirs = true
     }
@@ -344,8 +513,22 @@ walk_proc :: proc(info: os.File_Info, in_err: os.Errno, user_data: rawptr) -> (e
   if len(presenter_filepath) != 0 && len(wiring_filepath) != 0 {
     parser := cast(^Parser)user_data
     err := remove_wiring_from_presenter(parser, presenter_filepath, wiring_filepath)
+    if err != .None {
+      fmt.eprintf("Failed to remove wiring from:\n  %s\n  %s\n,  error=%s", presenter_filepath, wiring_filepath, err)
+    } else {
+      err1 := replace_presenter_constructor_params(parser, presenter_filepath, wiring_filepath)
+      if err1 != .None {
+        fmt.eprintf("Failed to replace params in:\n  %s\n  %s\n,  error=%s", presenter_filepath, wiring_filepath, err)
+      } else {
+        os.unlink(wiring_filepath)
+      }
+    }
+  }
+  if len(key_filepath) != 0 {
+    parser := cast(^Parser)user_data
+    err := remove_wiring_bindings(parser, key_filepath)
     if err != nil {
-      fmt.eprintf("Failed to process pair:\n  %s\n  %s\n,  error=%s", presenter_filepath, wiring_filepath, err)
+      fmt.eprintf("Failed to process key file:\n  %s\n,  error=%s", key_filepath, err)
     }
   }
   // if this dir has no subdirs, no need to walk files in it: we've analyzed it
