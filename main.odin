@@ -336,6 +336,78 @@ replace_presenter_constructor_params :: proc(parser: ^Parser, presenter_filepath
   return .None
 }
 
+UpdateImportList :: enum {
+  None,
+  PresenterParseFailed,
+  WiringParseFailed
+}
+
+update_import_list :: proc(parser: ^Parser, presenter_filepath: string, wiring_filepath: string) -> (err: UpdateImportList) {
+  presenter_source : []u8
+  wiring_source : []u8
+  ok : bool
+  presenter_source, ok = os.read_entire_file_from_filename(presenter_filepath)
+  if !ok {
+    return .PresenterParseFailed
+  }
+  // TODO reuse trees from remove_wiring_from_presenter??
+  presenter_tree := parser_parse_string(parser^, nil, cstring(raw_data(presenter_source)), u32(len(presenter_source)))
+  wiring_source, ok = os.read_entire_file_from_filename(wiring_filepath)
+  if !ok {
+    return .WiringParseFailed
+  }
+  wiring_tree := parser_parse_string(parser^, nil, cstring(raw_data(wiring_source)), u32(len(wiring_source)))
+
+  query_source := `
+(import_list) @import_list
+`
+  error_offset : u32
+  error_type : QueryError
+
+  wiring_imports_cursor := query_cursor_new()
+  defer query_cursor_delete(wiring_imports_cursor)
+
+  presenter_imports_cursor := query_cursor_new()
+  defer query_cursor_delete(presenter_imports_cursor)
+
+  query := query_new(
+    language,
+    cstring(raw_data(query_source)),
+    u32(len(query_source)),
+    &error_offset,
+    &error_type
+  )
+
+  wiring_imports_query_match : QueryMatch
+  presenter_imports_query_match : QueryMatch
+  editable_presenter_source : [dynamic]u8
+  replaced := false
+
+  query_cursor_exec(wiring_imports_cursor, query, tree_root_node(wiring_tree))
+  query_cursor_next_match(wiring_imports_cursor, &wiring_imports_query_match)
+  assert(wiring_imports_query_match.capture_count == 1)
+
+  resize(&editable_presenter_source, len(presenter_source))
+  copy(editable_presenter_source[:], presenter_source[:])
+
+  query_cursor_exec(presenter_imports_cursor, query, tree_root_node(presenter_tree))
+  query_cursor_next_match(presenter_imports_cursor, &presenter_imports_query_match)
+  assert(presenter_imports_query_match.capture_count == 1)
+
+  wiring_imports_source := source_text(capture_by_index(wiring_imports_query_match, 0), wiring_source)
+
+  inject_at_elems(
+      &editable_presenter_source,
+    int(node_end_byte(capture_by_index(presenter_imports_query_match, 0).node)),
+    ..wiring_imports_source
+  )
+
+  if !os.write_entire_file(presenter_filepath, editable_presenter_source[:]) {
+    fmt.eprintf("failed to write updated file %s", presenter_filepath)
+  }
+  return .None
+}
+
 Remove_Wiring_Bindings_Error :: enum {
   None,
   KeyParseFailed,
@@ -516,11 +588,16 @@ walk_proc :: proc(info: os.File_Info, in_err: os.Errno, user_data: rawptr) -> (e
     if err != .None {
       fmt.eprintf("Failed to remove wiring from:\n  %s\n  %s\n,  error=%s", presenter_filepath, wiring_filepath, err)
     } else {
-      err1 := replace_presenter_constructor_params(parser, presenter_filepath, wiring_filepath)
+      err1 := update_import_list(parser, presenter_filepath, wiring_filepath)
       if err1 != .None {
-        fmt.eprintf("Failed to replace params in:\n  %s\n  %s\n,  error=%s", presenter_filepath, wiring_filepath, err)
+        fmt.eprintf("Failed to move imports in:\n  %s\n  %s\n,  error=%s", presenter_filepath, wiring_filepath, err1)
       } else {
-        os.unlink(wiring_filepath)
+        err2 := replace_presenter_constructor_params(parser, presenter_filepath, wiring_filepath)
+        if err2 != .None {
+          fmt.eprintf("Failed to replace params in:\n  %s\n  %s\n,  error=%s", presenter_filepath, wiring_filepath, err2)
+        } else {
+          os.remove(wiring_filepath)
+        }
       }
     }
   }
