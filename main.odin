@@ -65,6 +65,8 @@ foreign ts {
   node_end_byte :: proc(node: Node) -> u32 ---;
   node_start_point :: proc (node: Node) -> Point ---;
   node_end_point :: proc (node: Node) -> Point ---;
+  node_child_count :: proc (node: Node) -> u32 ---;
+  node_parent :: proc (node: Node) -> Node ---;
   query_new :: proc(language: Language, source: cstring, source_len: u32, error_offset: ^u32, error_type: ^QueryError) -> Query ---;
   query_cursor_new :: proc() -> QueryCursor ---;
   query_cursor_delete :: proc(cursor: QueryCursor) ---;
@@ -475,14 +477,18 @@ remove_wiring_bindings :: proc(parser: ^Parser, key_filepath: string) -> (err: R
     editable_source : [dynamic]u8
     resize(&editable_source, len(source))
     copy(editable_source[:], source[:])
-    if bind_call_count == 1  {
+
+    statements_node := node_parent(wiring_bind_call_node)
+    statements_child_count := node_child_count(statements_node)
+
+    if bind_call_count == 1 && statements_child_count == 1  {
       assert(entire_bindings_param_node.id != nil)
       remove_range(
         &editable_source,
         int(node_start_byte(entire_bindings_param_node)),
         int(node_end_byte(entire_bindings_param_node))
       )
-    } else if bind_call_count > 1 && wiring_bind_call_node.id != nil {
+    } else if wiring_bind_call_node.id != nil {
       remove_range(
         &editable_source,
         int(node_start_byte(wiring_bind_call_node)),
